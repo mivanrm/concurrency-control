@@ -16,15 +16,13 @@ TxnProcessor::TxnProcessor(CCMode mode)
     : mode_(mode), tp_(THREAD_COUNT), next_unique_id_(1) {
   if (mode_ == LOCKING_EXCLUSIVE_ONLY)
     lm_ = new LockManagerA(&ready_txns_);
-  else if (mode_ == LOCKING)
-    lm_ = new LockManagerB(&ready_txns_);
-
+  storage_ = new Storage();
   // Create the storage
-  if (mode_ == MVCC) {
-    storage_ = new MVCCStorage();
-  } else {
-    storage_ = new Storage();
-  }
+  // if (mode_ == MVCC) {
+  //   storage_ = new MVCCStorage();
+  // } else {
+    
+  // }
 
   storage_->InitStorage();
 
@@ -52,7 +50,7 @@ void* TxnProcessor::StartScheduler(void * arg) {
 }
 
 TxnProcessor::~TxnProcessor() {
-  if (mode_ == LOCKING_EXCLUSIVE_ONLY || mode_ == LOCKING)
+  if (mode_ == LOCKING_EXCLUSIVE_ONLY)
     delete lm_;
 
   delete storage_;
@@ -80,12 +78,9 @@ Txn* TxnProcessor::GetTxnResult() {
 
 void TxnProcessor::RunScheduler() {
   switch (mode_) {
-    case SERIAL:                 RunSerialScheduler(); break;
-    case LOCKING:                RunLockingScheduler(); break;
     case LOCKING_EXCLUSIVE_ONLY: RunLockingScheduler(); break;
     case OCC:                    RunOCCScheduler(); break;
-    case P_OCC:                  RunOCCParallelScheduler(); break;
-    case MVCC:                   RunMVCCScheduler();
+    // case MVCC:                   RunMVCCScheduler();
   }
 }
 
@@ -299,6 +294,7 @@ void TxnProcessor::RunOCCScheduler() {
           // Apply write and commit transaction
           ApplyWrites(transaction);
           transaction->status_ = COMMITTED;
+          txn_results_.Push(transaction);
         } 
         // The transaction has been modified
         else {
@@ -315,23 +311,8 @@ void TxnProcessor::RunOCCScheduler() {
         transaction->status_ = ABORTED;
       } 
 
-      txn_results_.Push(transaction);
     }
   }
-}
-
-void TxnProcessor::RunOCCParallelScheduler() {
-  // CPSC 438/538:
-  //
-  // Implement this method! Note that implementing OCC with parallel
-  // validation may need to create another method, like
-  // TxnProcessor::ExecuteTxnParallel.
-  // Note that you can use active_set_ and active_set_mutex_ we provided
-  // for you in the txn_processor.h
-  //
-  // [For now, run serial scheduler in order to make it through the test
-  // suite]
-  RunSerialScheduler();
 }
 
 void TxnProcessor::RunMVCCScheduler() {
@@ -365,7 +346,7 @@ void TxnProcessor::RunMVCCScheduler() {
         bool valid = MVCCCheckWrites(*finished);
         if (!valid) {
           // Release all locks
-          for (auto&& key : txn->writeset_) {
+          for (auto&& key : finished->writeset_) {
             storage_->Unlock(key);
           }
 
@@ -374,28 +355,20 @@ void TxnProcessor::RunMVCCScheduler() {
           finished->writes_.empty();
           finished->status_ = INCOMPLETE;
 
-          mutex_.Lock();
-          txn->unique_id_ = next_unique_id_;
-          next_unique_id_++;
-          txn_requests_.Push(finished);
-          mutex_.Unlock();
+          NewTxnRequest(finished);
         } else {
           // Commit the transaction
           ApplyWrites(finished);
 
           // Release all locks
-          for (auto&& key : txn->writeset_) {
+          for (auto&& key : finished->writeset_) {
             storage_->Unlock(key);
           }
-          txn->status_ = COMMITTED;
+          finished->status_ = COMMITTED;
+          txn_results_.Push(finished);
         }
       }
-      // If transaction is executed with abort vote
-      else if (transaction->Status() == COMPLETED_A) {
-        transaction->status_ = ABORTED;
-      } 
 
-      txn_results_.Push(transaction);
     }
   }
   // RunSerialScheduler();
@@ -441,8 +414,9 @@ bool TxnProcessor::MVCCCheckWrites(const Txn &txn) const{
   }
 
   for (auto&& key : txn.writeset_) {
-    if (!storage_->CheckWrite(key, txn.unique_id_))
+    if (!(storage_->CheckWrite(key, txn.unique_id_))){
       return false;
+    }
   }
 
   return true;

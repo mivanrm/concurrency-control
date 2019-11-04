@@ -11,12 +11,9 @@
 // Returns a human-readable string naming of the providing mode.
 string ModeToString(CCMode mode) {
   switch (mode) {
-    case SERIAL:                 return " Serial   ";
-    case LOCKING_EXCLUSIVE_ONLY: return " Locking A";
-    case LOCKING:                return " Locking B";
+    case LOCKING_EXCLUSIVE_ONLY: return " SIMPLE LOCKING";
     case OCC:                    return " OCC      ";
-    case P_OCC:                  return " OCC-P    ";
-    case MVCC:                   return " MVCC     ";
+    // case MVCC:                   return " MVCC     ";
     default:                     return " INVALID MODE";
   }
 }
@@ -79,8 +76,8 @@ void Benchmark(const vector<LoadGen*>& lg) {
   deque<Txn*> doneTxns;
 
   // For each MODE...
-  for (CCMode mode = MVCC;
-      mode <= MVCC;
+  for (CCMode mode = LOCKING_EXCLUSIVE_ONLY;
+      mode <= OCC;
       mode = static_cast<CCMode>(mode+1)) {
     // Print out mode name.
     cout << ModeToString(mode) << flush;
