@@ -16,15 +16,13 @@ TxnProcessor::TxnProcessor(CCMode mode)
     : mode_(mode), tp_(THREAD_COUNT), next_unique_id_(1) {
   if (mode_ == LOCKING_EXCLUSIVE_ONLY)
     lm_ = new LockManagerA(&ready_txns_);
-  else if (mode_ == LOCKING)
-    lm_ = new LockManagerB(&ready_txns_);
-
+  storage_ = new Storage();
   // Create the storage
-  if (mode_ == MVCC) {
-    storage_ = new MVCCStorage();
-  } else {
-    storage_ = new Storage();
-  }
+  // if (mode_ == MVCC) {
+  //   storage_ = new MVCCStorage();
+  // } else {
+    
+  // }
 
   storage_->InitStorage();
 
@@ -52,7 +50,7 @@ void* TxnProcessor::StartScheduler(void * arg) {
 }
 
 TxnProcessor::~TxnProcessor() {
-  if (mode_ == LOCKING_EXCLUSIVE_ONLY || mode_ == LOCKING)
+  if (mode_ == LOCKING_EXCLUSIVE_ONLY)
     delete lm_;
 
   delete storage_;
@@ -80,12 +78,9 @@ Txn* TxnProcessor::GetTxnResult() {
 
 void TxnProcessor::RunScheduler() {
   switch (mode_) {
-    case SERIAL:                 RunSerialScheduler(); break;
-    case LOCKING:                RunLockingScheduler(); break;
     case LOCKING_EXCLUSIVE_ONLY: RunLockingScheduler(); break;
     case OCC:                    RunOCCScheduler(); break;
-    case P_OCC:                  RunOCCParallelScheduler(); break;
-    case MVCC:                   RunMVCCScheduler();
+    // case MVCC:                   RunMVCCScheduler();
   }
 }
 
@@ -260,79 +255,64 @@ void TxnProcessor::ApplyWrites(Txn* txn) {
   }
 }
 
-/**
- * Precondition: No storage writes are occuring during execution.
- */
-bool TxnProcessor::OCCValidateTransaction(const Txn &txn) const {
-  // Check
-  for (auto&& key : txn.readset_) {
-    if (txn.occ_start_time_ < storage_->Timestamp(key))
-      return false;
-  }
-
-  for (auto&& key : txn.writeset_) {
-    if (txn.occ_start_time_ < storage_->Timestamp(key))
-      return false;
-  }
-
-  return true;
-}
-
 void TxnProcessor::RunOCCScheduler() {
-  // Fetch transaction requests, and immediately begin executing them.
+  // Start executing transaction requests.
+  Txn *transaction;
+  // While thread pool active
   while (tp_.Active()) {
-    Txn *txn;
-    if (txn_requests_.Pop(&txn)) {
-
-      // Start txn running in its own thread.
-      tp_.RunTask(new Method<TxnProcessor, void, Txn*>(
-                  this,
-                  &TxnProcessor::ExecuteTxn,
-                  txn));
+    if (txn_requests_.Pop(&transaction)) {
+      // Get OCC start time
+      transaction->occ_start_time_ = GetTime();
+      // Execute transaction in a thread
+      tp_.RunTask(new Method<TxnProcessor, void, Txn*>(this, &TxnProcessor::ExecuteTxn, transaction));
     }
 
-    // Validate completed transactions, serially
-    Txn *finished;
-    while (completed_txns_.Pop(&finished)) {
-      if (finished->Status() == COMPLETED_A) {
-        finished->status_ = ABORTED;
-      } else {
-        bool valid = OCCValidateTransaction(*finished);
-        if (!valid) {
-          // Cleanup and restart
-          finished->reads_.empty();
-          finished->writes_.empty();
-          finished->status_ = INCOMPLETE;
+    // Verified the transaction whether has been modified or not
+    bool hasModified = false;
+    // Check the completed transaction
+    while (completed_txns_.Pop(&transaction)) {
+      // If transaction is executed with commit vote
+      if (transaction->Status() == COMPLETED_C) {
+        // Check read timestamp of transaction
+        for (set<Key>::iterator iter = transaction->readset_.begin(); iter != transaction->readset_.end(); ++iter) {
+          if (storage_->Timestamp(*iter) > transaction->occ_start_time_) {
+            hasModified = true;
+            break;
+          }
+        }
 
-          mutex_.Lock();
-          txn->unique_id_ = next_unique_id_;
-          next_unique_id_++;
-          txn_requests_.Push(finished);
-          mutex_.Unlock();
-        } else {
-          // Commit the transaction
-          ApplyWrites(finished);
-          txn->status_ = COMMITTED;
+        // Check write timestamp of transaction
+        for (set<Key>::iterator iter = transaction->writeset_.begin(); iter != transaction->writeset_.end(); ++iter) {
+          if (storage_->Timestamp(*iter) > transaction->occ_start_time_) {
+            hasModified = true;
+            break;
+          }
+        }
+
+        // The transaction has not been modified
+        if (!hasModified) {
+          // Apply write and commit transaction
+          ApplyWrites(transaction);
+          transaction->status_ = COMMITTED;
+          txn_results_.Push(transaction);
+        } 
+        // The transaction has been modified
+        else {
+          // Cleanup and restart transaction
+          transaction->reads_.empty();
+          transaction->writes_.empty();
+          transaction->status_ = INCOMPLETE;
+
+          NewTxnRequest(transaction);
         }
       }
+      // If transaction is executed with abort vote
+      else if (transaction->Status() == COMPLETED_A) {
+        transaction->status_ = ABORTED;
+      } 
 
-      txn_results_.Push(finished);
     }
   }
-}
-
-void TxnProcessor::RunOCCParallelScheduler() {
-  // CPSC 438/538:
-  //
-  // Implement this method! Note that implementing OCC with parallel
-  // validation may need to create another method, like
-  // TxnProcessor::ExecuteTxnParallel.
-  // Note that you can use active_set_ and active_set_mutex_ we provided
-  // for you in the txn_processor.h
-  //
-  // [For now, run serial scheduler in order to make it through the test
-  // suite]
-  RunSerialScheduler();
 }
 
 void TxnProcessor::RunMVCCScheduler() {
@@ -345,6 +325,99 @@ void TxnProcessor::RunMVCCScheduler() {
   //
   // [For now, run serial scheduler in order to make it through the test
   // suite]
-  RunSerialScheduler();
+
+  while (tp_.Active()) {
+    Txn *txn;
+    if (txn_requests_.Pop(&txn)) {
+
+      // Start txn running in its own thread.
+      tp_.RunTask(new Method<TxnProcessor, void, Txn*>(
+                  this,
+                  &TxnProcessor::MVCCExecuteTxn,
+                  txn));
+    }
+
+    // Validate completed transactions, serially
+    Txn *finished;
+    while (completed_txns_.Pop(&finished)) {
+      if (finished->Status() == COMPLETED_A) {
+        finished->status_ = ABORTED;
+      } else {
+        bool valid = MVCCCheckWrites(*finished);
+        if (!valid) {
+          // Release all locks
+          for (auto&& key : finished->writeset_) {
+            storage_->Unlock(key);
+          }
+
+          // Cleanup and restart
+          finished->reads_.empty();
+          finished->writes_.empty();
+          finished->status_ = INCOMPLETE;
+
+          NewTxnRequest(finished);
+        } else {
+          // Commit the transaction
+          ApplyWrites(finished);
+
+          // Release all locks
+          for (auto&& key : finished->writeset_) {
+            storage_->Unlock(key);
+          }
+          finished->status_ = COMMITTED;
+          txn_results_.Push(finished);
+        }
+      }
+
+    }
+  }
+  // RunSerialScheduler();
 }
 
+void TxnProcessor::MVCCExecuteTxn(Txn* txn) {
+
+  // Get the start time
+  txn->occ_start_time_ = GetTime();
+
+  // Read everything in from readset.
+  for (set<Key>::iterator it = txn->readset_.begin();
+       it != txn->readset_.end(); ++it) {
+    // Save each read result iff record exists in storage.
+    Value result;
+    if (storage_->Read(*it, &result, txn->unique_id_))
+      txn->reads_[*it] = result;
+  }
+
+  // Also read everything in from writeset.
+  for (set<Key>::iterator it = txn->writeset_.begin();
+       it != txn->writeset_.end(); ++it) {
+    // Save each read result iff record exists in storage.
+    Value result;
+    if (storage_->Read(*it, &result, txn->unique_id_))
+      txn->reads_[*it] = result;
+  }
+
+  // Execute txn's program logic.
+  txn->Run();
+
+  // Hand the txn back to the RunScheduler thread.
+  completed_txns_.Push(txn);
+}
+
+/**
+ * Precondition: No storage writes are occuring during execution.
+ */
+bool TxnProcessor::MVCCCheckWrites(const Txn &txn) const{
+  // Acquire all locks
+  for (auto&& key : txn.writeset_) {
+    storage_->Lock(key);
+  }
+
+  for (auto&& key : txn.writeset_) {
+    if (!(storage_->CheckWrite(key, txn.unique_id_))){
+      return false;
+    }
+  }
+
+  return true;
+}
